@@ -40,13 +40,19 @@
 #include <tf2_ros/transform_broadcaster.h>
 #include <tf2_ros/transform_listener.h>
 #include <tf2_geometry_msgs/tf2_geometry_msgs.h>
+#include <image_geometry/stereo_camera_model.h>
 #include <visualization_msgs/Marker.h>
 #include <image_transport/image_transport.h>
+#include <image_transport/subscriber_filter.h>
 #include <cv_bridge/cv_bridge.h>
 #include <sensor_msgs/image_encodings.h>
 #include <dynamic_reconfigure/server.h>
 #include <std_srvs/SetBool.h>
 #include <std_msgs/String.h>
+#include <message_filters/subscriber.h>
+#include <message_filters/synchronizer.h>
+#include <message_filters/sync_policies/approximate_time.h>
+#include <depth_image_proc/depth_traits.h>
 
 #include "fiducial_msgs/Fiducial.h"
 #include "fiducial_msgs/FiducialArray.h"
@@ -65,15 +71,67 @@
 using namespace std;
 using namespace cv;
 
+class DepthTo3d {
+    template<class T>
+    DepthTo3d(const image_geometry::PinholeCameraModel& model, const T& one):
+            center_x(model.cx()),
+            center_y(model.cy()),
+            unit_scaling(depth_image_proc::DepthTraits<T>::toMeters(one)),
+            constant_x(unit_scaling / model.fx()),
+            constant_y(unit_scaling / model.fy())
+    {
+    }
+
+public:
+    template<class T>
+    static DepthTo3d create(const image_geometry::PinholeCameraModel& model) {
+        return DepthTo3d(model, T(1));
+    }
+
+    template<class P, class T>
+    inline P getPoint(float x, float y, T depth) {
+        return P {
+                (x - center_x) * depth * constant_x,
+                (y - center_y) * depth * constant_y,
+                depth_image_proc::DepthTraits<T>::toMeters(depth)
+        };
+    }
+
+    template<class P, class T>
+    P getImageCoords(float x, float y, float z) {
+        float depth = depth_image_proc::DepthTraits<T>::fromMeters(z);
+        return P {
+            x / (depth * constant_x) + center_x,
+            y / (depth * constant_y) + center_y
+        };
+    }
+
+    // Use correct principal point from calibration
+    const float center_x;
+    const float center_y;
+
+    // Combine unit conversion (if necessary) with scaling by focal length for computing (X,Y)
+    const double unit_scaling;
+    const float constant_x;
+    const float constant_y;
+};
+
 class FiducialsNode {
   private:
     ros::Publisher * vertices_pub;
     ros::Publisher * pose_pub;
 
     ros::Subscriber caminfo_sub;
-    ros::Subscriber ignore_sub;
+
+    typedef message_filters::sync_policies::ApproximateTime<sensor_msgs::Image, sensor_msgs::Image> SyncPolicy;
+    typedef message_filters::Synchronizer<SyncPolicy> Synchronizer;
+
     image_transport::ImageTransport it;
-    image_transport::Subscriber img_sub;
+    boost::shared_ptr<Synchronizer> rgb_depth_sync;
+    image_transport::SubscriberFilter sub_depth, sub_rgb;
+
+    ros::Subscriber ignore_sub;
+
     tf2_ros::TransformBroadcaster broadcaster;
 
     ros::ServiceServer service_enable_detections;
@@ -89,6 +147,8 @@ class FiducialsNode {
     bool publishFiducialTf;
 
     cv::Mat cameraMatrix;
+    image_geometry::PinholeCameraModel camera_model;
+
     cv::Mat distortionCoeffs;
     int frameNum;
     std::string frameId;
@@ -114,7 +174,7 @@ class FiducialsNode {
 
 
     void ignoreCallback(const std_msgs::String &msg);
-    void imageCallback(const sensor_msgs::ImageConstPtr &msg);
+    void imageCallback(const sensor_msgs::ImageConstPtr &depth_msg, const sensor_msgs::ImageConstPtr &rgb_msg);
     void camInfoCallback(const sensor_msgs::CameraInfo::ConstPtr &msg);
     void configCallback(aruco_detect::DetectorParamsConfig &config, uint32_t level);
 
@@ -254,7 +314,7 @@ void FiducialsNode::configCallback(aruco_detect::DetectorParamsConfig & config, 
     detectorParams->cornerRefinementMaxIterations = config.cornerRefinementMaxIterations;
     detectorParams->cornerRefinementMinAccuracy = config.cornerRefinementMinAccuracy;
     detectorParams->cornerRefinementWinSize = config.cornerRefinementWinSize;
-#if CV_MINOR_VERSION==2
+#if 0 && CV_MINOR_VERSION==2
     detectorParams->doCornerRefinement = config.doCornerRefinement;
 #else
     if (config.doCornerRefinement) {
@@ -296,6 +356,8 @@ void FiducialsNode::camInfoCallback(const sensor_msgs::CameraInfo::ConstPtr& msg
         return;
     }
 
+    camera_model.fromCameraInfo(msg);
+
     if (msg->K != boost::array<double, 9>({0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0})) {
         for (int i=0; i<3; i++) {
             for (int j=0; j<3; j++) {
@@ -315,28 +377,33 @@ void FiducialsNode::camInfoCallback(const sensor_msgs::CameraInfo::ConstPtr& msg
     }
 }
 
-void FiducialsNode::imageCallback(const sensor_msgs::ImageConstPtr & msg) {
+void FiducialsNode::imageCallback(const sensor_msgs::ImageConstPtr & depth_msg,
+                                  const sensor_msgs::ImageConstPtr & rgb_msg) {
     if (enable_detections == false) {
         return; //return without doing anything
     }
 
-    ROS_INFO("Got image %d", msg->header.seq);
+    ROS_INFO("Got image %d", rgb_msg->header.seq);
     frameNum++;
 
-    cv_bridge::CvImagePtr cv_ptr;
+    cv_bridge::CvImagePtr cv_ptr, cv_ptr_depth;
 
     fiducial_msgs::FiducialTransformArray fta;
-    fta.header.stamp = msg->header.stamp;
+    fta.header.stamp = rgb_msg->header.stamp;
     fta.header.frame_id = frameId;
-    fta.image_seq = msg->header.seq;
+    fta.image_seq = rgb_msg->header.seq;
 
     fiducial_msgs::FiducialArray fva;
-    fva.header.stamp = msg->header.stamp;
+    fva.header.stamp = rgb_msg->header.stamp;
     fva.header.frame_id = frameId;
-    fva.image_seq = msg->header.seq;
+    fva.image_seq = rgb_msg->header.seq;
+
+    assert(depth_msg->encoding == sensor_msgs::image_encodings::TYPE_16UC1
+            || depth_msg->encoding == sensor_msgs::image_encodings::TYPE_32FC1);
 
     try {
-        cv_ptr = cv_bridge::toCvCopy(msg, sensor_msgs::image_encodings::BGR8);
+        cv_ptr = cv_bridge::toCvCopy(rgb_msg, sensor_msgs::image_encodings::BGR8);
+        cv_ptr_depth = cv_bridge::toCvCopy(depth_msg);
 
         vector <int>  ids;
         vector <vector <Point2f> > corners, rejected;
@@ -384,18 +451,36 @@ void FiducialsNode::imageCallback(const sensor_msgs::ImageConstPtr & msg) {
                                       rvecs, tvecs,
                                       reprojectionError);
 
+            bool depthIsFloat = cv_ptr_depth->image.type() == CV_32F;
+
+            DepthTo3d d3d = depthIsFloat ? DepthTo3d::create<float>(camera_model)
+                                       : DepthTo3d::create<uint16_t>(camera_model);
+
             for (size_t i=0; i<ids.size(); i++) {
+                Vec3d pos = tvecs[i];
                 aruco::drawAxis(cv_ptr->image, cameraMatrix, distortionCoeffs,
-                                rvecs[i], tvecs[i], (float)fiducial_len);
+                                rvecs[i], pos, (float)fiducial_len);
 
                 ROS_INFO("Detected id %d T %.2f %.2f %.2f R %.2f %.2f %.2f", ids[i],
-                         tvecs[i][0], tvecs[i][1], tvecs[i][2],
+                         pos[0], pos[1], pos[2],
                          rvecs[i][0], rvecs[i][1], rvecs[i][2]);
 
                 if (std::count(ignoreIds.begin(), ignoreIds.end(), ids[i]) != 0) {
                     ROS_INFO("Ignoring id %d", ids[i]);
                     continue;
                 }
+
+                // re-estimate position based on depth map
+                Vec2d imageCoords = depthIsFloat ? d3d.getImageCoords<Vec2d, float>(pos[0], pos[1], pos[2])
+                                                 : d3d.getImageCoords<Vec2d, uint16_t>(pos[0], pos[1], pos[2]);
+
+                float trueDepth = depthIsFloat? cv_ptr_depth->image.at<float>(std::round(imageCoords[1]), std::round(imageCoords[0]))
+                        : cv_ptr_depth->image.at<uint16_t>(std::round(imageCoords[1]), std::round(imageCoords[0]));
+
+                Vec3d truePos = depthIsFloat? d3d.getPoint<Vec3d, float>(imageCoords[0], imageCoords[1], trueDepth)
+                        : d3d.getPoint<Vec3d, uint16_t>(imageCoords[0], imageCoords[1], trueDepth);
+
+                pos = truePos;
 
                 double angle = norm(rvecs[i]);
                 Vec3d axis = rvecs[i] / angle;
@@ -405,9 +490,9 @@ void FiducialsNode::imageCallback(const sensor_msgs::ImageConstPtr & msg) {
                 fiducial_msgs::FiducialTransform ft;
                 ft.fiducial_id = ids[i];
 
-                ft.transform.translation.x = tvecs[i][0];
-                ft.transform.translation.y = tvecs[i][1];
-                ft.transform.translation.z = tvecs[i][2];
+                ft.transform.translation.x = pos[0];
+                ft.transform.translation.y = pos[1];
+                ft.transform.translation.z = pos[2];
 
                 tf2::Quaternion q;
                 q.setRotation(tf2::Vector3(axis[0], axis[1], axis[2]), angle);
@@ -423,7 +508,7 @@ void FiducialsNode::imageCallback(const sensor_msgs::ImageConstPtr & msg) {
                 // Convert image_error (in pixels) to object_error (in meters)
                 ft.object_error =
                     (reprojectionError[i] / dist(corners[i][0], corners[i][2])) *
-                    (norm(tvecs[i]) / fiducial_len);
+                    (norm(pos) / fiducial_len);
 
                 fta.transforms.push_back(ft);
 
@@ -432,7 +517,7 @@ void FiducialsNode::imageCallback(const sensor_msgs::ImageConstPtr & msg) {
                     geometry_msgs::TransformStamped ts;
                     ts.transform = ft.transform;
                     ts.header.frame_id = frameId;
-                    ts.header.stamp = msg->header.stamp;
+                    ts.header.stamp = rgb_msg->header.stamp;
                     ts.child_frame_id = "fiducial_" + std::to_string(ft.fiducial_id);
                     broadcaster.sendTransform(ts);
                 }
@@ -579,10 +664,24 @@ FiducialsNode::FiducialsNode() : nh(), pnh("~"), it(nh)
 
     dictionary = aruco::getPredefinedDictionary(dicno);
 
-    img_sub = it.subscribe("camera", 1,
-                        &FiducialsNode::imageCallback, this);
+    //img_sub = it.subscribe("camera", 1,
+    //                    &FiducialsNode::imageCallback, this);
 
-    caminfo_sub = nh.subscribe("camera_info", 1,
+    // parameter for depth_image_transport hint
+    std::string depth_image_transport_param = "depth_transport";
+
+    // depth image can use different transport.(e.g. compressedDepth)
+    image_transport::TransportHints depth_hints("raw", ros::TransportHints(), pnh, depth_image_transport_param);
+    sub_depth.subscribe(it, pnh.param<string>("depth_topic", "camera/depth/image_raw"),       1, depth_hints);
+
+    // rgb uses normal ros transport hints.
+    image_transport::TransportHints hints("raw", ros::TransportHints(), pnh);
+    sub_rgb.subscribe(it,  pnh.param<string>("image_topic", "camera/rgb/image_color"), 1, hints);
+
+    rgb_depth_sync.reset( new Synchronizer(SyncPolicy(5), sub_depth, sub_rgb) );
+    rgb_depth_sync->registerCallback(boost::bind(&FiducialsNode::imageCallback, this, _1, _2));
+
+    caminfo_sub = nh.subscribe(pnh.param<string>("image_info_topic", "camera_info"), 1,
                     &FiducialsNode::camInfoCallback, this);
 
     ignore_sub = nh.subscribe("ignore_fiducials", 1,
@@ -601,7 +700,7 @@ FiducialsNode::FiducialsNode() : nh(), pnh("~"), it(nh)
     pnh.param<int>("cornerRefinementMaxIterations", detectorParams->cornerRefinementMaxIterations, 30);
     pnh.param<double>("cornerRefinementMinAccuracy", detectorParams->cornerRefinementMinAccuracy, 0.01); /* default 0.1 */
     pnh.param<int>("cornerRefinementWinSize", detectorParams->cornerRefinementWinSize, 5);
-#if CV_MINOR_VERSION==2
+#if 0 && CV_MINOR_VERSION==2
     pnh.param<bool>("doCornerRefinement",detectorParams->doCornerRefinement, true); /* default false */
 #else
     bool doCornerRefinement = true;

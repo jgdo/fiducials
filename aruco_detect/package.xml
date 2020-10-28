@@ -20,10 +20,10 @@
   <depend>visualization_msgs</depend>
   <depend>image_transport</depend>
   <depend>sensor_msgs</depend>
+  <depend>image_geometry</depend>
   <depend>cv_bridge</depend>
   <depend>fiducial_msgs</depend>
   <depend>dynamic_reconfigure</depend>
   <depend>python-cairosvg</depend>
   <depend>python-joblib</depend>
-
 </package>
