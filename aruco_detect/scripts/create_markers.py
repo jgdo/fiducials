@@ -1,8 +1,10 @@
-#!/usr/bin/python
+#!/usr/bin/env python
 
 import os, sys, argparse
 import subprocess
 import imp, importlib
+
+
 
 # Hack if a user has 'em' instead of 'empy' installed with pip
 # If the module em doesn't have the expand function use the full path
@@ -15,7 +17,7 @@ for path in sys.path:
              break
 # For-else: else is called if loop doesn't break 
 else:
-    print "ERROR: could not find module em, please sudo apt install python-empy"
+    print("ERROR: could not find module em, please sudo apt install python-empy")
     exit(2)
 
 import cv2
@@ -28,11 +30,11 @@ Generate a PDF file containaing one or more fiducial marker for printing
 def checkCmd(cmd, package):
     rc = os.system("which %s > /dev/null" % cmd)
     if rc != 0:
-        print """This utility requires %s. It can be installed by typing:
-    sudo apt install %s""" % (cmd, package)
+        print("""This utility requires %s. It can be installed by typing:
+    sudo apt install %s""" % (cmd, package))
         sys.exit(1)
      
-def genSvg(id, dicno, paper_size):
+def genSvg(id, dicno, paper_size, fid_len):
     return em.expand("""<svg width="@(paper_width)mm" height="@(paper_height)mm"
  version="1.1"
  xmlns:xlink="http://www.w3.org/1999/xlink"
@@ -80,16 +82,16 @@ def genSvg(id, dicno, paper_size):
   <text x="@(paper_width/2)mm" y="@((paper_height + fid_len)/2 + 30)mm" text-anchor="middle" style="font-family:ariel; font-size:24;">@(id) D@(dicno)</text>
 
 </svg>
-""", {"id": id, "dicno": dicno, "paper_width": paper_size[0], "paper_height": paper_size[1], "fid_len": 140.0})
+""", {"id": id, "dicno": dicno, "paper_width": paper_size[0], "paper_height": paper_size[1], "fid_len": fid_len})
 
-def genMarker(i, dicno, paper_size):
-    print " Marker %d\r" % i,
+def genMarker(i, dicno, paper_size, fid_len):
+    print(" Marker %d\r" % i)
     sys.stdout.flush()
     aruco_dict = aruco.Dictionary_get(dicno)
     img = aruco.drawMarker(aruco_dict, i, 2000)
     cv2.imwrite("/tmp/marker%d.png" % i, img)
-    svg = genSvg(i, dicno, paper_size)
-    cairo = subprocess.Popen(('cairosvg', '-f', 'pdf', '-o', '/tmp/marker%d.pdf' % i, '/dev/stdin'), stdin=subprocess.PIPE)
+    svg = genSvg(i, dicno, paper_size, fid_len)
+    cairo = subprocess.Popen(('cairosvg', '-f', 'pdf', '-o', '/tmp/marker%d.pdf' % i, '/dev/stdin'), stdin=subprocess.PIPE, encoding='utf8')
     cairo.communicate(input=svg)
     # This way is faster than subprocess, but causes problems when cairosvg is installed from pip
     # because newer versions only support python3, and opencv3 from ros does not
@@ -111,7 +113,9 @@ if __name__ == "__main__":
     parser.add_argument('dictionary', type=int, default='7', nargs='?',
                         help='dictionary to generate from')
     parser.add_argument('--paper-size', dest='paper_size', action='store',
-                        default='letter', help='paper size to use (letter or a4)')
+                        default='a4', help='paper size to use (letter or a4)')
+    parser.add_argument('--marker-size', dest='fid_len', action='store', type=int,
+                        default='140', help='marker size in mm')
 
     args = parser.parse_args()
 
@@ -126,20 +130,24 @@ if __name__ == "__main__":
     elif args.paper_size == 'a4':
         paper_size  = (210, 297)
 
+    fid_len = args.fid_len
+
+    print("paper_size: {}".format(paper_size))
+
     try:
         # For a parallel version
         from joblib import Parallel, delayed
-        Parallel(n_jobs=-1)(delayed(genMarker)(i, dicno, paper_size) for i in markers)
+        Parallel(n_jobs=-1)(delayed(genMarker)(i, dicno, paper_size, fid_len) for i in markers)
     except ImportError:
         # Fallback to serial version
         for i in markers:
-            genMarker(i, dicno, paper_size)
+            genMarker(i, dicno, paper_size, fid_len)
 
-    print "Combining into %s" % outfile
+    print("Combining into %s" % outfile)
     os.system("pdfunite %s %s" % (" ".join(pdfs), outfile))
     for f in pdfs:
         os.remove(f)
 
-    print '\033[91m' + """After printing, please make sure that the long lines around the marker are
-EXACTLY 14.0 cm long. This is required for accurate position estimation.""" + '\033[0m'
+    print('\033[91m' + """After printing, please make sure that the long lines around the marker are
+EXACTLY {} mm long. This is required for accurate position estimation.""".format(fid_len) + '\033[0m')
 
